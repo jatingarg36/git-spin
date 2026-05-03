@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/<user>/git-spin/main/git-spin -o /u
 Or clone and install locally:
 
 ```bash
-git clone https://github.com/<user>/git-spin.git
+git clone https://github.com/jatingarg36/git-spin.git
 cd git-spin
 sudo ./install.sh
 ```
