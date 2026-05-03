@@ -5,7 +5,7 @@ Multi-repo [git worktree](https://git-scm.com/docs/git-worktree) manager. Create
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<user>/git-spin/main/git-spin -o /usr/local/bin/git-spin && chmod +x /usr/local/bin/git-spin
+curl -fsSL https://raw.githubusercontent.com/jatingarg36/git-spin/master/git-spin -o /usr/local/bin/git-spin && chmod +x /usr/local/bin/git-spin
 ```
 
 Or clone and install locally:
