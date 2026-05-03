@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.4.0"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+info()  { printf "${GREEN}[✓]${RESET} %s\n" "$*"; }
+warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$*"; }
+err()   { printf "${RED}[✗]${RESET} %s\n" "$*" >&2; }
+
+usage() {
+    cat <<EOF
+${BOLD}git-spin${RESET} v${VERSION} — Multi-repo worktree manager
+
+${BOLD}USAGE${RESET}
+    git-spin start <workspace> <repo...> [--dir <path>]
+    git-spin stop  <workspace> [<repo...>] [--dir <path>]
+    git-spin list  [--dir <path>]
+
+${BOLD}COMMANDS${RESET}
+    start   Create worktrees branched from latest origin/master (or origin/main).
+            Worktrees are placed in <dir>/<workspace>/<repo>.
+            Can be run again to add more repos to an existing workspace.
+    stop    Remove worktrees and delete local branches.
+            Without repos, removes the entire workspace directory.
+    list    Show all workspaces created by git-spin.
+
+${BOLD}OPTIONS${RESET}
+    --dir <path>    Base directory containing repos (default: current directory).
+                    The workspace directory is also created here.
+
+${BOLD}EXAMPLES${RESET}
+    git-spin start feature-x api payments
+    git-spin start feature-x checkout --dir ~/repos
+    git-spin list
+    git-spin stop feature-x
+EOF
+}
+
+parse_args() {
+    BASE_DIR="$PWD"
+    WORKSPACE=""
+    REPOS=()
+
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir)
+                BASE_DIR="${2:?'--dir requires a path'}"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#positional[@]} -ge 1 ]]; then
+        WORKSPACE="${positional[0]}"
+    fi
+    if [[ ${#positional[@]} -ge 2 ]]; then
+        REPOS=("${positional[@]:1}")
+    fi
+}
+
+detect_default_branch() {
+    local repo_path="$1"
+    if git -C "$repo_path" rev-parse --verify origin/master &>/dev/null; then
+        echo "origin/master"
+    elif git -C "$repo_path" rev-parse --verify origin/main &>/dev/null; then
+        echo "origin/main"
+    else
+        echo ""
+    fi
+}
+
+# --- In-place render engine ---
+
+render_lines() {
+    local status_dir="$1"
+    local frame="$2"
+    shift 2
+    local repos=("$@")
+    local count=${#repos[@]}
+    local spinner="${SPINNER_FRAMES[$((frame % ${#SPINNER_FRAMES[@]}))]}"
+
+    # Move cursor up to overwrite previous render
+    if [[ "$frame" -gt 0 ]]; then
+        printf "\033[%dA" "$count"
+    fi
+
+    for repo in "${repos[@]}"; do
+        local status_file="$status_dir/$repo"
+        local state="pending" detail=""
+        if [[ -f "$status_file" ]]; then
+            state=$(head -1 "$status_file")
+            detail=$(tail -n +2 "$status_file" | paste -s -d ' ' -)
+        fi
+
+        # Clear the line
+        printf "\033[2K"
+
+        local col1
+        col1=$(printf "  %-20s" "$repo")
+
+        case "$state" in
+            pending)
+                printf "%s ${DIM}○${RESET}  ${DIM}waiting${RESET}\n" "$col1"
+                ;;
+            running)
+                printf "%s ${CYAN}%s${RESET}  %s\n" "$col1" "$spinner" "$detail"
+                ;;
+            done)
+                printf "%s ${GREEN}✓${RESET}  %s\n" "$col1" "$detail"
+                ;;
+            skipped)
+                printf "%s ${YELLOW}●${RESET}  %s\n" "$col1" "$detail"
+                ;;
+            failed)
+                printf "%s ${RED}✗${RESET}  %s\n" "$col1" "$detail"
+                ;;
+        esac
+    done
+}
+
+all_done() {
+    local status_dir="$1"
+    shift
+    local repos=("$@")
+    for repo in "${repos[@]}"; do
+        local state="pending"
+        [[ -f "$status_dir/$repo" ]] && state=$(head -1 "$status_dir/$repo")
+        case "$state" in
+            done|skipped|failed) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+render_loop() {
+    local status_dir="$1"
+    shift
+    local repos=("$@")
+    local frame=0
+
+    # Initial render
+    render_lines "$status_dir" "$frame" "${repos[@]}"
+
+    while ! all_done "$status_dir" "${repos[@]}"; do
+        sleep 0.1
+        ((frame++))
+        render_lines "$status_dir" "$frame" "${repos[@]}"
+    done
+
+    # Final render to show completed state
+    ((frame++))
+    render_lines "$status_dir" "$frame" "${repos[@]}"
+}
+
+# --- Workers ---
+
+spin_worker() {
+    local repo="$1" base_dir="$2" workspace="$3" ws_dir="$4" status_file="$5"
+    local repo_path="$base_dir/$repo"
+    local wt_path="$ws_dir/$repo"
+
+    if [[ ! -d "$repo_path" ]]; then
+        printf "failed\nRepo not cloned: %s" "$repo_path" > "$status_file"
+        return
+    fi
+
+    if ! git -C "$repo_path" rev-parse --git-dir &>/dev/null; then
+        printf "failed\nNot a git repository" > "$status_file"
+        return
+    fi
+
+    if [[ -d "$wt_path" ]]; then
+        printf "skipped\nAlready spun" > "$status_file"
+        return
+    fi
+
+    printf "running\nFetching origin..." > "$status_file"
+    git -C "$repo_path" fetch origin --quiet
+
+    local base_ref
+    base_ref=$(detect_default_branch "$repo_path")
+    if [[ -z "$base_ref" ]]; then
+        printf "failed\nNo origin/master or origin/main found" > "$status_file"
+        return
+    fi
+
+    printf "running\nCreating worktree from %s..." "$base_ref" > "$status_file"
+    mkdir -p "$ws_dir"
+
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$workspace" 2>/dev/null; then
+        git -C "$repo_path" worktree add "$wt_path" "$workspace" --quiet
+    else
+        git -C "$repo_path" worktree add -b "$workspace" "$wt_path" "$base_ref" --quiet
+    fi
+
+    printf "done\nWorktree ready ← %s" "$base_ref" > "$status_file"
+}
+
+unspin_worker() {
+    local repo="$1" base_dir="$2" workspace="$3" ws_dir="$4" status_file="$5"
+    local repo_path="$base_dir/$repo"
+    local wt_path="$ws_dir/$repo"
+
+    if [[ ! -d "$wt_path" ]]; then
+        printf "skipped\nNo worktree found" > "$status_file"
+        return
+    fi
+
+    printf "running\nRemoving worktree..." > "$status_file"
+    git -C "$repo_path" worktree remove "$wt_path" --force 2>/dev/null || true
+
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$workspace" 2>/dev/null; then
+        printf "running\nDeleting branch..." > "$status_file"
+        git -C "$repo_path" branch -D "$workspace" --quiet 2>/dev/null || true
+    fi
+
+    printf "done\nCleaned up" > "$status_file"
+}
+
+# --- Commands ---
+
+cmd_start() {
+    if [[ -z "$WORKSPACE" ]]; then
+        err "Missing workspace name"
+        usage
+        exit 1
+    fi
+    if [[ ${#REPOS[@]} -eq 0 ]]; then
+        err "At least one repo is required"
+        usage
+        exit 1
+    fi
+
+    local ws_dir="$BASE_DIR/$WORKSPACE"
+    local status_dir
+    status_dir=$(mktemp -d)
+
+    printf "\n${BOLD}${CYAN}Starting workspace: %s${RESET}\n" "$WORKSPACE"
+    printf "  ${DIM}%s${RESET}\n\n" "$ws_dir"
+
+    export -f spin_worker detect_default_branch
+
+    for repo in "${REPOS[@]}"; do
+        spin_worker "$repo" "$BASE_DIR" "$WORKSPACE" "$ws_dir" "$status_dir/$repo" &
+    done
+
+    render_loop "$status_dir" "${REPOS[@]}"
+
+    # Summary
+    local created=0 skipped=0 failed=0
+    for repo in "${REPOS[@]}"; do
+        local state=$(head -1 "$status_dir/$repo" 2>/dev/null || echo "failed")
+        case "$state" in
+            done)    ((created++)) ;;
+            skipped) ((skipped++)) ;;
+            *)       ((failed++))  ;;
+        esac
+    done
+    rm -rf "$status_dir"
+
+    printf "\n  ${BOLD}Done:${RESET} ${GREEN}%d created${RESET}  ${YELLOW}%d skipped${RESET}  ${RED}%d failed${RESET}\n\n" "$created" "$skipped" "$failed"
+}
+
+cmd_stop() {
+    if [[ -z "$WORKSPACE" ]]; then
+        err "Missing workspace name"
+        usage
+        exit 1
+    fi
+
+    local ws_dir="$BASE_DIR/$WORKSPACE"
+
+    if [[ ! -d "$ws_dir" ]]; then
+        warn "Workspace directory not found: $ws_dir"
+        return
+    fi
+
+    local scan_repos=()
+    if [[ ${#REPOS[@]} -gt 0 ]]; then
+        scan_repos=("${REPOS[@]}")
+    else
+        for entry in "$ws_dir"/*/; do
+            [[ -d "$entry" ]] || continue
+            scan_repos+=("$(basename "$entry")")
+        done
+    fi
+
+    if [[ ${#scan_repos[@]} -eq 0 ]]; then
+        warn "No repos found in workspace '$WORKSPACE'"
+        return
+    fi
+
+    local status_dir
+    status_dir=$(mktemp -d)
+
+    printf "\n${BOLD}${CYAN}Stopping workspace: %s${RESET}\n\n" "$WORKSPACE"
+
+    export -f unspin_worker
+
+    for repo in "${scan_repos[@]}"; do
+        unspin_worker "$repo" "$BASE_DIR" "$WORKSPACE" "$ws_dir" "$status_dir/$repo" &
+    done
+
+    render_loop "$status_dir" "${scan_repos[@]}"
+    rm -rf "$status_dir"
+
+    if [[ -d "$ws_dir" ]] && [[ -z "$(ls -A "$ws_dir" 2>/dev/null)" ]]; then
+        rmdir "$ws_dir"
+    fi
+
+    printf "\n  ${GREEN}✓${RESET} ${BOLD}Workspace removed${RESET}\n\n"
+}
+
+cmd_list() {
+    printf "\n${BOLD}${CYAN}Workspaces in %s${RESET}\n" "$BASE_DIR"
+
+    local found=false
+
+    for ws_dir in "$BASE_DIR"/*/; do
+        [[ -d "$ws_dir" ]] || continue
+
+        local has_worktree=false
+        for repo_dir in "$ws_dir"/*/; do
+            [[ -d "$repo_dir" ]] || continue
+            if [[ -f "$repo_dir/.git" ]]; then
+                has_worktree=true
+                break
+            fi
+        done
+
+        [[ "$has_worktree" == false ]] && continue
+        found=true
+
+        local ws_name
+        ws_name=$(basename "$ws_dir")
+        printf "\n  ${BOLD}${CYAN}%s${RESET}\n" "$ws_name"
+
+        for repo_dir in "$ws_dir"/*/; do
+            [[ -d "$repo_dir" ]] || continue
+            [[ -f "$repo_dir/.git" ]] || continue
+
+            local repo_name
+            repo_name=$(basename "$repo_dir")
+            local branch
+            branch=$(git -C "$repo_dir" branch --show-current 2>/dev/null || echo "?")
+
+            printf "    %-20s ${DIM}branch:${RESET} %s\n" "$repo_name" "$branch"
+        done
+    done
+
+    if [[ "$found" == false ]]; then
+        warn "No workspaces found"
+    fi
+    echo
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+
+    local command="$1"
+    shift
+
+    case "$command" in
+        start)
+            parse_args "$@"
+            cmd_start
+            ;;
+        stop)
+            parse_args "$@"
+            cmd_stop
+            ;;
+        list)
+            parse_args "$@"
+            cmd_list
+            ;;
+        --version|-v)
+            echo "git-spin v${VERSION}"
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            err "Unknown command: $command"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
